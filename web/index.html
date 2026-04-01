@@ -1,0 +1,283 @@
+<!DOCTYPE html>
+<html lang="en">
+
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Trading Simulation Dashboard</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <style>
+        body {
+            background: #f8f9fa;
+            font-family: 'Inter', sans-serif;
+        }
+
+        .card {
+            border-radius: 12px;
+            border: none;
+            box-shadow: 0 4px 12px rgba(0, 0, 0, 0.05);
+        }
+
+        .table-container {
+            max-height: 500px;
+            overflow-y: auto;
+        }
+
+        .stat-card {
+            text-align: center;
+            padding: 15px;
+            border-radius: 10px;
+        }
+
+        .stat-value {
+            font-size: 1.5rem;
+            font-weight: bold;
+        }
+
+        .win {
+            color: #198754;
+        }
+
+        .loss {
+            color: #dc3545;
+        }
+
+        .result-win {
+            background: #e6f4ea;
+            color: #1e7e34;
+            font-weight: bold;
+        }
+
+        .result-loss {
+            background: #fce8e6;
+            color: #d93025;
+            font-weight: bold;
+        }
+
+        .loader {
+            display: none;
+            margin: 20px auto;
+            border: 4px solid #f3f3f3;
+            border-top: 4px solid #3498db;
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 2s linear infinite;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+    </style>
+</head>
+
+<body>
+    <div class="container py-5">
+        <h2 class="mb-4 text-center">📈 Trading Strategy Simulator</h2>
+
+        <div class="card p-4 mb-4">
+            <div class="row g-3">
+                <div class="col-md-4">
+                    <label class="form-label">Simulation Date</label>
+                    <input type="date" id="dateInput" class="form-control" value="2026-03-24">
+                </div>
+                <div class="col-md-8">
+                    <label class="form-label">Select Symbols</label>
+                    <div id="symbolsContainer" class="d-flex flex-wrap gap-2 py-2">
+                        <!-- Symbols will be loaded here -->
+                        <span class="text-muted">Select a date first...</span>
+                    </div>
+                </div>
+                <div class="col-12 text-center mt-4">
+                    <button id="runBtn" class="btn btn-primary px-5 py-2 fw-bold" disabled>Run Simulation</button>
+                </div>
+            </div>
+        </div>
+
+        <div id="loader" class="loader"></div>
+
+        <div id="resultsArea" style="display: none;">
+            <ul class="nav nav-tabs mb-4" id="symbolTabs" role="tablist"></ul>
+            <div class="tab-content" id="symbolTabContents"></div>
+        </div>
+    </div>
+
+    <script>
+        const dateInput = document.getElementById('dateInput');
+        const symbolsContainer = document.getElementById('symbolsContainer');
+        const runBtn = document.getElementById('runBtn');
+        const loader = document.getElementById('loader');
+        const resultsArea = document.getElementById('resultsArea');
+
+        let selectedSymbols = new Set();
+
+        async function loadSymbols() {
+            const date = dateInput.value;
+            if (!date) return;
+
+            symbolsContainer.innerHTML = '<div class="spinner-border spinner-border-sm text-primary"></div>';
+            try {
+                const res = await fetch(`/api/symbols?date=${date}`);
+                const symbols = await res.json();
+
+                symbolsContainer.innerHTML = '';
+                selectedSymbols.clear();
+
+                if (symbols.length === 0) {
+                    symbolsContainer.innerHTML = '<span class="text-danger">No symbols found for this date.</span>';
+                    runBtn.disabled = true;
+                    return;
+                }
+
+                symbols.forEach(sym => {
+                    const btn = document.createElement('button');
+                    btn.className = 'btn btn-outline-secondary btn-sm';
+                    btn.textContent = sym;
+                    btn.onclick = () => {
+                        if (selectedSymbols.has(sym)) {
+                            selectedSymbols.delete(sym);
+                            btn.classList.replace('btn-primary', 'btn-outline-secondary');
+                        } else {
+                            selectedSymbols.add(sym);
+                            btn.classList.replace('btn-outline-secondary', 'btn-primary');
+                        }
+                        runBtn.disabled = selectedSymbols.size === 0;
+                    };
+                    symbolsContainer.appendChild(btn);
+                });
+            } catch (err) {
+                symbolsContainer.innerHTML = '<span class="text-danger">Error loading symbols.</span>';
+            }
+        }
+
+        dateInput.onchange = loadSymbols;
+        window.onload = loadSymbols;
+
+        runBtn.onclick = async () => {
+            const payload = {
+                date: dateInput.value,
+                symbols: Array.from(selectedSymbols)
+            };
+
+            loader.style.display = 'block';
+            resultsArea.style.display = 'none';
+            runBtn.disabled = true;
+
+            try {
+                const res = await fetch('/api/simulate', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify(payload)
+                });
+                const results = await res.json();
+                renderResults(results);
+            } catch (err) {
+                alert('Simulation failed: ' + err.message);
+            } finally {
+                loader.style.display = 'none';
+                runBtn.disabled = false;
+            }
+        };
+
+        function renderResults(results) {
+            resultsArea.style.display = 'block';
+            const tabs = document.getElementById('symbolTabs');
+            const contents = document.getElementById('symbolTabContents');
+
+            tabs.innerHTML = '';
+            contents.innerHTML = '';
+
+            results.forEach((res, index) => {
+                const { symbol, summary, trades } = res;
+
+                // Tab Header
+                const tabItem = document.createElement('li');
+                tabItem.className = 'nav-item';
+                tabItem.innerHTML = `
+                    <button class="nav-link ${index === 0 ? 'active' : ''}" 
+                            data-bs-toggle="tab" data-bs-target="#tab-${index}">
+                        ${symbol}
+                    </button>`;
+                tabs.appendChild(tabItem);
+
+                // Tab Pane
+                const pane = document.createElement('div');
+                pane.className = `tab-pane fade ${index === 0 ? 'show active' : ''}`;
+                pane.id = `tab-${index}`;
+
+                const pnlClass = summary.net_pnl >= 0 ? 'win' : 'loss';
+
+                pane.innerHTML = `
+                    <div class="row g-3 mb-4">
+                        <div class="col-md-3">
+                            <div class="card stat-card">
+                                <small class="text-muted">Final Balance</small>
+                                <div class="stat-value">₹${summary.final_balance.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card stat-card">
+                                <small class="text-muted">Net PnL</small>
+                                <div class="stat-value ${pnlClass}">₹${summary.net_pnl.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
+                                <small class="${pnlClass}">(${summary.net_pnl_pct.toFixed(2)}%)</small>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card stat-card">
+                                <small class="text-muted">Total Charges</small>
+                                <div class="stat-value text-secondary">₹${summary.total_charges.toLocaleString(undefined, { minimumFractionDigits: 2 })}</div>
+                            </div>
+                        </div>
+                        <div class="col-md-3">
+                            <div class="card stat-card">
+                                <small class="text-muted">Win Rate</small>
+                                <div class="stat-value">${((summary.win_trades / summary.total_trades) * 100 || 0).toFixed(1)}%</div>
+                                <small>${summary.win_trades}W / ${summary.loss_trades}L</small>
+                            </div>
+                        </div>
+                    </div>
+
+                    <div class="card p-3">
+                        <h5 class="mb-3">Detailed Trade Log</h5>
+                        <div class="table-container">
+                            <table class="table table-hover table-sm">
+                                <thead class="table-light sticky-top">
+                                    <tr>
+                                        <th>#</th><th>Type</th><th>Time</th><th>Entry</th><th>Exit</th>
+                                        <th>Lots</th><th>Charges</th><th>Net PnL</th><th>Balance</th><th>Result</th>
+                                    </tr>
+                                </thead>
+                                <tbody>
+                                    ${trades.map(t => `
+                                        <tr>
+                                            <td>${t.number}</td>
+                                            <td><span class="badge bg-light text-dark">${t.type}</span></td>
+                                            <td>${t.time}</td>
+                                            <td>${t.entry_price.toFixed(2)}</td>
+                                            <td>${t.exit_price.toFixed(2)}</td>
+                                            <td>${t.lots}</td>
+                                            <td>${t.charges.toFixed(2)}</td>
+                                            <td class="${t.net_pnl >= 0 ? 'win' : 'loss'}">${t.net_pnl.toFixed(2)}</td>
+                                            <td>${t.balance.toFixed(2)}</td>
+                                            <td><span class="badge ${t.result === 'WIN' ? 'bg-success' : 'bg-danger'}">${t.result}</span></td>
+                                        </tr>
+                                    `).join('')}
+                                </tbody>
+                            </table>
+                        </div>
+                    </div>
+                `;
+                contents.appendChild(pane);
+            });
+        }
+    </script>
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+
+</html>
