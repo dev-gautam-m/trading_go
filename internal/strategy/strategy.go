@@ -33,6 +33,11 @@ type Strategy struct {
 	LossPoints   float64 `json:"loss_points"`
 	TotalCharges float64 `json:"total_charges"`
 	Trades       []Trade `json:"trades"`
+	IsStopped    bool    `json:"is_stopped"`
+
+	// Slippage Management
+	PendingAction     string `json:"-"`
+	SlippageTickCount int    `json:"-"`
 }
 
 // Trade represents a single executed trade log.
@@ -69,41 +74,51 @@ func (s *Strategy) Init(currentPrice float64, timestamp string) {
 
 // OnPrice handles a new price tick and executes strategy logic.
 func (s *Strategy) OnPrice(price float64, timestamp string) {
-	// 0. Trailing Entry (Downward Trail)
-	// If price moves down, we move the entry trigger down with it to maintain the gap.
-	if !s.InTrade && (price+s.SL_ENTRY_POINTS < s.EntryTrigger) {
-		// oldTrigger := s.EntryTrigger
-		s.EntryTrigger = price + s.SL_ENTRY_POINTS
-		// log.Printf("[TRAIL-ENTRY] Price dropped to %.2f. Moving Entry Trigger from %.2f down to %.2f\n", price, oldTrigger, s.EntryTrigger)
-		modifyBuyStopOrder(s.EntryTrigger)
-	}
-
-	// 1. Entry
-	if !s.InTrade && price >= s.EntryTrigger {
-		// Calculate Max Lots
-		lots := int(s.Balance / (price * float64(s.LotSize)))
-		if lots < 1 {
-			// fmt.Printf("[%s] Insufficient funds for 1 lot at %.2f. Balance: %.2f\n", s.Symbol, price, s.Balance)
-			return
-		}
-
-		s.InTrade = true
-		s.EntryPrice = price
-		s.Quantity = lots * s.LotSize
-
-		// Deduct premium
-		cost := s.EntryPrice * float64(s.Quantity)
-		s.Balance -= cost
-
-		s.StopLoss = s.EntryPrice - s.SL_EXIT_POINTS
-		s.LastTrailLevel = s.EntryPrice
-
-		// log.Printf("[ENTRY] [%s] Entered with %d units at %.2f. Cost: %.2f. New Balance: %.2f\n", s.Symbol, s.Quantity, s.EntryPrice, cost, s.Balance)
-		placeStopLossOrder(s.StopLoss)
+	// 0. Check if instrument is stopped
+	if s.IsStopped {
 		return
 	}
 
-	// 2. Trailing
+	// 1. Handle Pending Slippage Executions
+	if s.PendingAction != "" {
+		if s.SlippageTickCount >= SLIPPAGE_TICKS {
+			if s.PendingAction == "ENTRY" {
+				s.executeEntry(price, timestamp)
+			} else if s.PendingAction == "EXIT" {
+				s.executeExit(price, price, timestamp)
+			}
+			s.PendingAction = ""
+			s.SlippageTickCount = 0
+			return
+		}
+		s.SlippageTickCount++
+		return
+	}
+
+	// 2. Proactive Price Cutoff
+	if !s.InTrade && price < MIN_TRADE_PRICE {
+		s.IsStopped = true
+		return
+	}
+
+	// 3. Trailing Entry (Downward Trail)
+	if !s.InTrade && (price+s.SL_ENTRY_POINTS < s.EntryTrigger) {
+		s.EntryTrigger = price + s.SL_ENTRY_POINTS
+		modifyBuyStopOrder(s.EntryTrigger)
+	}
+
+	// 4. Entry Signal Check
+	if !s.InTrade && price >= s.EntryTrigger {
+		if SLIPPAGE_TICKS == 0 {
+			s.executeEntry(price, timestamp)
+		} else {
+			s.PendingAction = "ENTRY"
+			s.SlippageTickCount = 1
+		}
+		return
+	}
+
+	// 5. Trailing Stop Loss
 	if s.InTrade {
 		trailed := false
 		for price >= s.LastTrailLevel+s.SL_ENTRY_POINTS {
@@ -112,73 +127,106 @@ func (s *Strategy) OnPrice(price float64, timestamp string) {
 			trailed = true
 		}
 		if trailed {
-			// log.Printf("[TRAIL] Price at %.2f. Moved SL up to %.2f\n", price, s.StopLoss)
 			modifyStopLossOrder(s.StopLoss)
 		}
 	}
 
-		// 3. Exit
-		if s.InTrade && price <= s.StopLoss {
-			s.TotalTrades++
-
-			// Calculate proceeds and charges
-			sellAmount := s.StopLoss * float64(s.Quantity)
-			turnover := (s.EntryPrice + s.StopLoss) * float64(s.Quantity)
-			charges := FIXED_CHARGE_PER_TRADE + (turnover * TURNOVER_CHARGE_PCT)
-
-			s.Balance += (sellAmount - charges)
-			s.TotalCharges += charges
-
-			profitPoints := s.StopLoss - s.EntryPrice
-			result := "LOSS"
-			if profitPoints >= 0 {
-				s.WinTrades++
-				s.WinPoints += profitPoints
-				result = "WIN"
-			} else {
-				s.LossTrades++
-				s.LossPoints += (-profitPoints)
-			}
-
-			// Format Timestamp
-			formattedTime := timestamp
-			if ms, err := strconv.ParseInt(timestamp, 10, 64); err == nil {
-				formattedTime = time.UnixMilli(ms).Format("15:04:05")
-			}
-
-			// Record Trade
-			tradeType := "RE-ENTRY"
-			if s.TotalTrades == 1 {
-				tradeType = "BUY"
-			}
-
-			s.Trades = append(s.Trades, Trade{
-				Number:     s.TotalTrades,
-				Type:       tradeType,
-				Time:       formattedTime,
-				EntryPrice: s.EntryPrice,
-				ExitPrice:  s.StopLoss,
-				Lots:       s.Quantity / s.LotSize,
-				Charges:    charges,
-				NetPnL:     (sellAmount - charges) - (s.EntryPrice * float64(s.Quantity)),
-				Balance:    s.Balance,
-				Result:     result,
-			})
-
-			// log.Printf("[EXIT] [%s] Closed at %.2f. Proceeds: %.2f. Charges: %.2f. Net Balance: %.2f\n", s.Symbol, s.StopLoss, sellAmount, charges, s.Balance)
-			closePosition()
-
-			// reset
-			s.InTrade = false
-			s.EntryPrice = 0
-			s.StopLoss = 0
-			s.LastTrailLevel = 0
-			s.Quantity = 0
-
-			// re-arm
-			s.EntryTrigger = price + s.SL_ENTRY_POINTS
-			placeBuyStopOrder(s.EntryTrigger)
+	// 6. Exit Signal Check
+	if s.InTrade && price <= s.StopLoss {
+		if SLIPPAGE_TICKS == 0 {
+			s.executeExit(s.StopLoss, price, timestamp)
+		} else {
+			s.PendingAction = "EXIT"
+			s.SlippageTickCount = 1
 		}
+		return
+	}
+}
+
+// executeEntry performs the actual trade entry logic.
+func (s *Strategy) executeEntry(price float64, timestamp string) {
+	// Calculate Max Lots and account for estimated fees (Fixed + Turnover-based)
+	denom := float64(s.LotSize) * (price + (2*price-s.SL_EXIT_POINTS)*TURNOVER_CHARGE_PCT)
+	lots := int((s.Balance - FIXED_CHARGE_PER_TRADE) / denom)
+
+	if lots < 1 {
+		return
+	}
+
+	s.InTrade = true
+	s.EntryPrice = price
+	s.Quantity = lots * s.LotSize
+
+	// Deduct premium
+	cost := s.EntryPrice * float64(s.Quantity)
+	s.Balance -= cost
+
+	s.StopLoss = s.EntryPrice - s.SL_EXIT_POINTS
+	s.LastTrailLevel = s.EntryPrice
+
+	placeStopLossOrder(s.StopLoss)
+}
+
+// executeExit performs the actual trade exit logic.
+func (s *Strategy) executeExit(execPrice float64, currentPrice float64, timestamp string) {
+	s.TotalTrades++
+
+	// Calculate proceeds and charges
+	sellAmount := execPrice * float64(s.Quantity)
+	turnover := (s.EntryPrice + execPrice) * float64(s.Quantity)
+	charges := FIXED_CHARGE_PER_TRADE + (turnover * TURNOVER_CHARGE_PCT)
+
+	s.Balance += (sellAmount - charges)
+	s.TotalCharges += charges
+
+	profitPoints := execPrice - s.EntryPrice
+	result := "LOSS"
+	if profitPoints >= 0 {
+		s.WinTrades++
+		s.WinPoints += profitPoints
+		result = "WIN"
+	} else {
+		s.LossTrades++
+		s.LossPoints += (-profitPoints)
+	}
+
+	// Format Timestamp
+	formattedTime := timestamp
+	if ms, err := strconv.ParseInt(timestamp, 10, 64); err == nil {
+		formattedTime = time.UnixMilli(ms).Format("15:04:05")
+	}
+
+	// Record Trade
+	tradeType := "RE-ENTRY"
+	if s.TotalTrades == 1 {
+		tradeType = "BUY"
+	}
+
+	s.Trades = append(s.Trades, Trade{
+		Number:     s.TotalTrades,
+		Type:       tradeType,
+		Time:       formattedTime,
+		EntryPrice: s.EntryPrice,
+		ExitPrice:  execPrice,
+		Lots:       s.Quantity / s.LotSize,
+		Charges:    charges,
+		NetPnL:     (sellAmount - charges) - (s.EntryPrice * float64(s.Quantity)),
+		Balance:    s.Balance,
+		Result:     result,
+	})
+
+	closePosition()
+
+	// reset
+	s.InTrade = false
+	s.EntryPrice = 0
+	s.StopLoss = 0
+	s.LastTrailLevel = 0
+	s.Quantity = 0
+
+	// re-arm
+	s.EntryTrigger = currentPrice + s.SL_ENTRY_POINTS
+	placeBuyStopOrder(s.EntryTrigger)
 }
 
 // ForceExit closes any open position at the final known price.
